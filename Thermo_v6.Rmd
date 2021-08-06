@@ -1,5 +1,5 @@
 ---
-title: "thermogradient_workflow_v5_finaldraft"
+title: "thermogradient_workflow_v6"
 output:
   html_document:
     df_print: paged
@@ -7,6 +7,7 @@ output:
   word_document: default
 ---
 To use this script, you should have thermo gradient plate (TGP) data set up in this format: 
+
 
 species, cell_x, cell_y, day, c_germination, day_temp, night_temp, viable_n, where: 
 
