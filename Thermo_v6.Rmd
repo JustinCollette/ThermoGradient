@@ -1,0 +1,687 @@
+---
+title: "thermogradient_workflow_v5_finaldraft"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  word_document: default
+---
+To use this script, you should have thermo gradient plate (TGP) data set up in this format: 
+
+species, cell_x, cell_y, day, c_germination, day_temp, night_temp, viable_n, where: 
+
+species is the plant species, 
+cell_x and cell_y are the coordinates of the cell on the TGP (usually an alphanumeric grid on the TGP),
+day is the day germination was checked and the number of days the experiment has been running (day 0 should be the first day of the experiment),
+c_germinated is the cumulative  germination for each day
+day_temp is the temperature of the cell during 'day' simulation,
+night_temp is the temperature of the cell during 'night' simulation,
+viable_n is the number of viable seeds in each cell - this can be determined before (with a 'global' viability) or after the experiment (via cut-tests). 
+
+An example of how the data needs to be set up can be found here: [link to example data?]
+
+
+You can run each 'chunk' of code by clicking the run button in the top right of each chunk, or you can run each line manually. 
+
+Please read instructions before each chunk. Items *highlighted* indicate something that needs to be changed by the user. 
+
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+library(tidyverse)
+library(raster)
+library(mgcv)
+library(gratia)
+library(akima)
+library(fields)
+library(viridis)
+library(germinationmetrics)
+library(rgdal)
+
+#Make sure you have this file in your working directory
+source("thermo_seed_functions.R")
+```
+
+For use after completing a run on the thermogradient plate. This script is for analysing germination data
+
+Step 1. Use the 'germinationmetrics' package to create a data frame with dozens of germination indicies. 
+
+The 'germination.indicies' function creates several dozen very useful germination metrics, however it requires even intervals of checking germination. Because many germination experiments don't have even intervals of checking, we developed the 'smooth_impute' function that models cumulative germination and fills in blank days with the likely amount of germination that occurred on that day based on actual germination before and after the blank. This creates a dataframe that essentially has germination checks on every day of the experiment, which allows 'germination.indices' to work. 
+
+Insert the name of your datafile in the *read.csv()* function. 
+
+```{r}
+data <- read.csv()
+
+#this limits the max germination to the amount of viable seeds. (useful for when viability is factored in as a blanket proportion)
+data <- data%>%
+  mutate(c_germinated=ifelse(c_germinated>viable_n, viable_n, c_germinated))
+
+data_id <- data%>%
+  group_by(day)%>%
+  mutate(grouped_id= row_number())
+
+
+
+#creating wide data for germination indices function 
+wide_data <- data_id%>%
+  pivot_wider(names_from = day, values_from = c_germinated, id_cols = c(species, cell_x, cell_y, day_temp, night_temp, viable_n))
+
+
+
+## adding in missing days and impute some values in between
+
+# first auto-find the missing days and add the columns
+missing_days <- (1:max(data_id$day))[!(1:max(data_id$day)) %in% data_id$day]
+wide_data[as.character(missing_days)] <- NA
+
+# now split the data so it's easier to work with
+treatment_data <- dplyr::select(wide_data, species, cell_x, cell_y, day_temp, night_temp, viable_n)
+germ_day_data <- dplyr::select(wide_data, -cell_x, cell_y, -species, -day_temp, -night_temp, -viable_n)
+
+# order the columns according to days
+cols_in_order <- as.character(sort(as.numeric(names(germ_day_data))))
+germ_day_data <- germ_day_data[,cols_in_order]
+
+# now impute cumulative germination numbers
+smooth_impute <- function(c_germ, days) {
+  data <- data.frame(x = days, y = c_germ) %>% na.omit()
+  fm <- gam(y ~ s(x, bs = "cs", k = nrow(data)), data = data)
+  preds <- round(predict(fm, newdata = data.frame(x = days), type = "response"))
+  preds[preds < 0] <- 0
+  preds[preds > max(c_germ)] <- max(c_germ)
+  preds
+}
+# apply the impute function
+germ_day_data_filled_final <- as.data.frame(t(
+  apply(X = germ_day_data, MARGIN = 1, FUN = smooth_impute, 
+        as.numeric(names(germ_day_data)))
+  ))
+
+
+
+
+# join back to the original (removing rows with no germination in original data so germination.indicies works - they are added back later)
+wide_data_filled <- data.frame(treatment_data, germ_day_data_filled_final)[rowSums(germ_day_data, na.rm = T) != 0,]
+
+
+#this function calculates all the gemination indices you would ever need!
+germ_cols <- (ncol(treatment_data)+1):ncol(wide_data_filled)
+
+indices <- germination.indices(wide_data_filled, 
+                                total.seeds.col = 'viable_n',
+                                counts.intervals.cols = names(wide_data_filled)[germ_cols],
+                                intervals= 1:length(germ_cols),
+                                partial=FALSE,
+                                max.int = ncol(germ_day_data_filled_final))
+
+
+indices<- indices[, -c(germ_cols)]
+
+#add the rows back in that had zero germination
+indices <- dplyr::bind_rows(indices, treatment_data[rowSums(germ_day_data, na.rm = T) == 0,])
+
+#change NAs to zeros
+indices[is.na(indices)] <- 0
+
+#create prop_germ to use instead of germ percent
+indices <- indices%>%
+  mutate(prop_germ=GermPercent/100)
+
+
+```
+
+
+
+Step 2 - Choose the data you want to analyse and view it: This creates a rasterised contour plot of the germination data. 
+
+To change the data that this figure is displaying, *change variable to be displayed (default is indices$prop_germ), which is the third argument in the interpp() function*
+
+For proportion germination data, we recommend setting 'zlim=(c(0,1))' in the 'quilt.plot' argument, if you are comparing multiple species. 
+
+For t50, and other rate data, we recommend setting 'col=rev(viridis(1000, option='c')))', as higher values indicate slower germination (this is user preference). 
+
+We recommend changing the title of the graph to suit the germination index you are focussing on via main = '' within quilt.plot. 
+
+```{r}
+
+grd <- expand.grid(x = seq(min(indices$day_temp),max(indices$day_temp),length=100), 
+                   y = seq(min(indices$night_temp), max(indices$night_temp), length=100))
+
+res <- interpp(indices$day_temp, indices$night_temp, indices$prop_germ, xo = grd$x, yo = grd$y)
+
+
+
+quilt.plot(res$x, res$y, res$z, xlab = "Day temp (°C)", 
+           ylab = "Night temp (°C)", main = "Thermo gradient plate final germination observations",
+           col=(viridis(1000, option='C')))
+        
+
+
+
+```
+
+
+
+
+Step 3 - model the data ! 
+
+Step 3.1 - Choosing the best model
+
+As a default, models here are Generalised Additive Models (GAMs). 
+
+In the formula list below, there are some recommended default models. Your data may or may not fit these models well. If your models are not running, try changing the 'k=' argument within formula (for example 'formula(prop_germ~te(day_temp, night_temp, bs='tp', k=4))'). Start with 'k=4' and reduce until it works. This helps for data with a low number of observations. 
+
+*Change the modelled variable to any of the variables in the indices dataframe.* the default variable is prop_germ. 
+
+ 
+
+'mc_list' runs the functions created above to resample model data. It also plots the output of the models. 'fraction=0.9'  is a default, and 'n=100' should generally be enough to get consistent results. These can be changed to suit your needs. 
+*'mod_family' needs to be changed to suit the data.* For proportion germination data, mod_family='binomial' is suitable. For t50 data, mod_family='gaussian' is suitable. 
+
+
+'mc_table' then orders the models by performance according to their mean error. You can also assess a model's performance based on the RMSE and correlation Values. You can decide the 'best' fitting model based off all of these values, however, we recommend deciding based on correlation and RMSE as a first step. Mean error should be used when correlation and RMSE are very close.  
+
+```{r message=FALSE, warning=FALSE}
+
+formula_list <- list(
+  formula(prop_germ~te(day_temp, night_temp, bs='tp')), 
+  formula(prop_germ~te(day_temp, night_temp, bs='ts')),
+  formula(prop_germ~te(day_temp, night_temp, bs='cr')),
+  formula(prop_germ~ti(day_temp, night_temp, bs='tp')),
+  formula(prop_germ~s(day_temp, night_temp, bs='tp')),
+  formula(prop_germ~s(day_temp, night_temp, bs='tp') + s(day_temp) + s(night_temp)),
+  formula(prop_germ~s(day_temp, bs='tp') + s(night_temp, bs='tp'))
+                     )
+                     
+                  
+
+mc_list <- lapply(X = formula_list, FUN = fit_mc_resampling, 
+                  mod_data = indices, fraction = 0.9, n = 100, weights = indices$viable_n, mod_family='binomial')
+
+mc_table <- arrange(bind_rows(mc_list), mean_error); View(mc_table)
+
+
+```
+
+
+
+Step 3.2 Chose the model that performed best based on the 'mc_table'. Generally, this is the model with the lowest RMSE value and the highest correlation value. 
+
+*Replace the GAM by copying the best performing model from 'mc_table'* (you can copy and paste it straight from the table). This is then the model that you will be basing your predictions on. 
+You will also need to change the *model family*, based on what 'mod_family' you have chosen above. 
+
+
+
+
+As an example, the full model should be formated like this (with the best performing mode based on your data):
+
+full_mod <-  gam(prop_germ ~ s(day_temp, night_temp, bs = "tp"),
+                 family = 'binomial' , weights = indices$viable_n, method='REML', data=indices)
+                 
+                 
+
+
+```{r}
+full_mod <-  gam(#replace this text with the best performing model) #	,
+                 family = 'binomial' , weights = indices$viable_n, method='REML', data=indices)
+summary(full_mod)
+anova(full_mod)
+
+```
+
+
+
+3.4 - visualise the modelled data. Create a contour plot with the predicted data from the model and compare to actual data. The same recommendations apply here from the first quilt plot. 
+
+
+```{r message=FALSE, warning=FALSE}
+
+newdata <- grd%>%
+  rename('day_temp'='x', 'night_temp'='y')
+
+predicted_data <- predict(full_mod, newdata, type='response')
+
+predicted_data <-  as.data.frame(predicted_data)
+
+predicted_data <- cbind(predicted_data, newdata)
+
+  
+predicted_data <- predicted_data%>%
+  mutate(temp_index=day_temp-night_temp)%>%
+  filter(temp_index>0)%>%
+  dplyr::select(-temp_index)
+
+
+
+
+
+
+real_data_plot <- quilt.plot(res$x, res$y, res$z, xlab = "day temp", 
+           ylab = "night temp", main = "Thermo gradient plate final germination observations", 
+           col=viridis(1000, option='C'))
+           
+
+
+res_pred <- interpp(predicted_data$day_temp, predicted_data$night_temp, predicted_data$predicted_data,
+                xo = grd$x, yo = grd$y)
+
+
+predicted_data_plot <- quilt.plot(res_pred$x, res_pred$y, res_pred$z, xlab = "day temp", 
+           ylab = "night temp", main = "Thermo gradient plate final germination predictions", 
+           col=viridis(1000, option='C'))
+
+```
+
+
+Step 4 - use current climate to predict when germination is most likely to occur in the temperatures of your chosen location. This downloads data from 'Worldclim' 
+
+See: https://worldclim.org/
+
+
+4.1 *Change the lat long to your species' coordinates (in decimal format)*
+
+```{r}
+lat<- #decimal latitude
+lon<- #deci mal longitude
+```
+
+4.2 download the current temperature from worldclim. 
+
+This step will produce a line graph with the current monthly maximum and minimum averages
+
+```{r}
+
+
+
+climate_tmax <- raster::getData('worldclim', var='tmax', res=0.5, lat=lat, lon=lon)
+climate_tmin <- raster::getData('worldclim', var='tmin', res=0.5, lat=lat, lon=lon)
+
+
+
+
+
+coords <- data.frame(x=lon, y=lat)
+
+point <- SpatialPoints(coords)
+
+value_max <- raster::extract(climate_tmax, point)
+value_min <- raster::extract(climate_tmin, point)
+
+
+df <- cbind.data.frame(coordinates(point), value_max, value_min)
+
+
+df1 <- as.data.frame(t(df))
+
+
+max_temps <- df1[c(3:14),]
+min_temps <- df1[c(15:26),]
+
+
+monthly_temps <- as.data.frame(cbind(max_temps, min_temps))
+
+
+monthly_temps <- monthly_temps%>%
+  mutate(max_temp_celcius=max_temps*.1, min_temp_celcius=min_temps*.1, max_temps=NULL, min_temps=NULL)
+
+
+months <- c('Jan', 'Feb', 'Mar', 'Apr', 'May', 
+            'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 
+            'Nov', 'Dec')
+
+
+monthly_temps$month <- factor(months, levels=c('Jan', 'Feb', 'Mar', 'Apr', 'May', 
+                                               'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 
+                                               'Nov', 'Dec'), ordered = TRUE)
+
+
+
+cols <- c('Mean max temp'='red', 'Mean min temp'='blue')
+
+
+ggplot(monthly_temps)+
+  geom_line(aes(x=month, y=max_temp_celcius, colour='Mean max temp'),group=1)+
+  geom_line(aes(x=month, y=min_temp_celcius, colour='Mean min temp'),group=1)+
+  theme_bw()+
+  labs(y='Temperature(°C)', x='Month')+
+  scale_colour_manual(name='', values=cols)+
+  ggtitle('Current monthly temperatures')
+
+
+```
+
+
+Step 4.3 - This uses the best model chosen above with the predict function to predict germination (for your chosen variable) in each month based on temperatures in the current climate. 
+
+We recommend setting 'lims(y=c(-0.05,1.05))' in the ggplot if you are looking at proportion germination
+
+```{r}
+
+#this is creating a dataframe with the temperatures that were downloaded previously
+## you can change the climate variable to min temp also by putting 'mean_temps$min_temp'
+newdata <- data.frame(monthly_temps$max_temp_celcius, monthly_temps$min_temp_celcius)%>%
+  rename('day_temp'='monthly_temps.max_temp_celcius')%>%
+  rename('night_temp'='monthly_temps.min_temp_celcius')
+
+#use the predict function to plot new temperatures with the model output
+df <- predict(full_mod, newdata, type='response', se.fit=TRUE)
+df <- as.data.frame(df)
+
+
+
+df$month <- factor(months, levels=c('Jan', 'Feb', 'Mar', 'Apr', 'May', 
+                                    'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 
+                                    'Nov', 'Dec'), ordered = TRUE)
+
+###in this dataframe, fit is the prediected germination response, se.fit is the standard error. 
+
+
+ggplot(df, aes(y=fit, x=month))+
+  geom_col()+
+  geom_errorbar(aes(ymax=fit+se.fit, ymin=fit-se.fit), width=0.2)+
+  labs(y="Predicted germination", x='Month')+
+  theme_classic()+
+  ggtitle('Predicted monthly germination in current climate')
+
+
+
+```
+
+
+
+Step 5 - predicting germination in the future with climate change. 
+
+
+5.1 downloading data. *IMPORTANT* skip this step if you have already downloaded the data (note it is disabled when knitting document). This needs to be explored in order to choose the climate models you want to use, the years you want to model to, and the different shared socio-economic pathways (SSP) to use. 
+
+In the case below, we are downloading all available models for the most extreme SSP scenario (ssp585) to the year 2100. To find the URLS to other models and scenarios, go to https://www.worldclim.org/data/cmip6/cmip6_clim2.5m.html. To get the URL, right click on the data -> copy link address, and paste it below. 
+```{r eval=FALSE, include=FALSE}
+url_1 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmin_BCC-CSM2-MR_ssp585_2081-2100.zip'
+url_2 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmax_BCC-CSM2-MR_ssp585_2081-2100.zip'
+url_3 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmin_IPSL-CM6A-LR_ssp585_2081-2100.zip'
+url_4 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmax_IPSL-CM6A-LR_ssp585_2081-2100.zip'
+url_5 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmin_MRI-ESM2-0_ssp585_2081-2100.zip'
+url_6 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmax_MRI-ESM2-0_ssp585_2081-2100.zip'
+url_7 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmin_CNRM-CM6-1_ssp585_2081-2100.zip'
+url_8 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmax_CNRM-CM6-1_ssp585_2081-2100.zip'
+url_9 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmin_CNRM-ESM2-1_ssp585_2081-2100.zip'
+url_10 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmax_CNRM-ESM2-1_ssp585_2081-2100.zip'
+url_11 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmin_CanESM5_ssp585_2081-2100.zip'
+url_12 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmax_CanESM5_ssp585_2081-2100.zip'
+url_13 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmin_MIROC-ES2L_ssp585_2081-2100.zip'
+url_14 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmax_MIROC-ES2L_ssp585_2081-2100.zip'
+url_15 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmin_MIROC6_ssp585_2081-2100.zip'
+url_16 <- 'http://biogeo.ucdavis.edu/data/worldclim/v2.1/fut/2.5m/wc2.1_2.5m_tmax_MIROC6_ssp585_2081-2100.zip'
+  
+  
+  
+download.file(url_1, destfile='tmin_CSM2-SSP585_2100.zip')
+download.file(url_2, destfile='tmax_CSM2-SSP585_2100.zip')
+download.file(url_3, destfile='tmin_IPSL-SSP585_2100.zip')
+download.file(url_4, destfile='tmax_IPSL-SSP585_2100.zip')
+download.file(url_5, destfile='tmin_MRI-ESM2-SSP585_2100.zip')
+download.file(url_6, destfile='tmax_MRI-ESM2-SSP585_2100.zip')
+download.file(url_7, destfile='tmin_CNRM-CM6-SSP585_2100.zip')
+download.file(url_8, destfile='tmax_CNRM-CM6-SSP585_2100.zip')
+download.file(url_9, destfile='tmin_CNRM-ESM21-SSP585_2100.zip')
+download.file(url_10, destfile='tmax_CNRM-ESM21-SSP585_2100.zip')
+download.file(url_11, destfile='tmin_CanESM5-SSP585_2100.zip')
+download.file(url_12, destfile='tmax_CanESM5-SSP585_2100.zip')
+download.file(url_13, destfile='tmin_MIROC-ES2L-SSP585_2100.zip')
+download.file(url_14, destfile='tmax_MIROC-ES2L-SSP585_2100.zip')
+download.file(url_15, destfile='tmin_MIROC6-SSP585_2100.zip')
+download.file(url_16, destfile='tmax_MIROC6-SSP585_2100.zip')
+
+
+```
+
+5.2 Creating the data frames with climate data at a coordinate on the globe (decimal lat lon entered previously). It will also create a plot with the current monthly temps and the future monthly temps for your given location. 
+
+```{r warning=FALSE}
+
+#unzip the files for use in R
+tmax_CSM2_ssp585_2100 <- unzip('tmax_CSM2-SSP585_2100.zip')
+tmin_CSM2_ssp585_2100 <- unzip('tmin_CSM2-SSP585_2100.zip')
+
+tmax_IPSL_ssp585_2100 <- unzip('tmax_IPSL-SSP585_2100.zip')
+tmin_IPSL_ssp585_2100 <- unzip('tmin_IPSL-SSP585_2100.zip')
+
+tmax_MRI.ESM2_ssp585_2100 <- unzip('tmax_MRI-ESM2-SSP585_2100.zip')
+tmin_MRI.ESM2_ssp585_2100 <- unzip('tmin_MRI-ESM2-SSP585_2100.zip')
+
+tmax_CNRM.CM6_ssp585_2100 <- unzip('tmax_CNRM-CM6-SSP585_2100.zip')
+tmin_CNRM.CM6_ssp585_2100 <- unzip('tmin_CNRM-CM6-SSP585_2100.zip')
+
+tmax_CNRM.ESM21_ssp585_2100 <- unzip('tmax_CNRM-ESM21-SSP585_2100.zip')
+tmin_CNRM.ESM21_ssp585_2100 <- unzip('tmin_CNRM-ESM21-SSP585_2100.zip')
+
+tmax_CanESM5_ssp585_2100 <- unzip('tmax_CanESM5-SSP585_2100.zip')
+tmin_CanESM5_ssp585_2100 <- unzip('tmin_CanESM5-SSP585_2100.zip')
+
+tmax_MIROC.ES2L_ssp585_2100 <- unzip('tmax_MIROC-ES2L-SSP585_2100.zip')
+tmin_MIROC.ES2L_ssp585_2100 <- unzip('tmin_MIROC-ES2L-SSP585_2100.zip')
+
+tmax_MIROC6_ssp585_2100 <- unzip('tmax_MIROC6-SSP585_2100.zip')
+tmin_MIROC6_ssp585_2100 <- unzip('tmin_MIROC6-SSP585_2100.zip')
+
+
+#imports a raster stack (1 layer for each month of the year)
+tmax_CSM2_ssp585_2100 <- stack(tmax_CSM2_ssp585_2100)
+tmin_CSM2_ssp585_2100 <- stack(tmin_CSM2_ssp585_2100)
+
+tmax_IPSL_ssp585_2100 <- stack(tmax_IPSL_ssp585_2100)
+tmin_IPSL_ssp585_2100 <- stack(tmin_IPSL_ssp585_2100)
+
+tmax_MRI.ESM2_ssp585_2100 <- stack(tmax_MRI.ESM2_ssp585_2100)
+tmin_MRI.ESM2_ssp585_2100 <- stack(tmin_MRI.ESM2_ssp585_2100)
+
+tmax_CNRM.CM6_ssp585_2100 <- stack(tmax_CNRM.CM6_ssp585_2100)
+tmin_CNRM.CM6_ssp585_2100 <- stack(tmin_CNRM.CM6_ssp585_2100)
+
+tmax_CNRM.ESM21_ssp585_2100 <- stack(tmax_CNRM.ESM21_ssp585_2100)
+tmin_CNRM.ESM21_ssp585_2100 <- stack(tmin_CNRM.ESM21_ssp585_2100)
+
+tmax_CanESM5_ssp585_2100 <- stack(tmax_CanESM5_ssp585_2100)
+tmin_CanESM5_ssp585_2100 <- stack(tmin_CanESM5_ssp585_2100)
+
+tmax_MIROC.ES2L_ssp585_2100 <- stack(tmax_MIROC.ES2L_ssp585_2100)
+tmin_MIROC.ES2L_ssp585_2100 <- stack(tmin_MIROC.ES2L_ssp585_2100)
+
+tmax_MIROC6_ssp585_2100 <- stack(tmax_MIROC6_ssp585_2100)
+tmin_MIROC6_ssp585_2100 <- stack(tmin_MIROC6_ssp585_2100)
+
+
+#points that you are interested in
+
+coords <- data.frame(x=lon, y=lat)
+
+point <- SpatialPoints(coords)
+
+CSM2_future_value_max <- raster::extract(tmax_CSM2_ssp585_2100, point)
+CSM2_future_value_min <- raster::extract(tmin_CSM2_ssp585_2100, point)
+
+IPSL_future_value_max <- raster::extract(tmax_IPSL_ssp585_2100, point)
+IPSL_future_value_min <- raster::extract(tmin_IPSL_ssp585_2100, point)
+
+MRI.ESM2_future_value_max <- raster::extract(tmax_MRI.ESM2_ssp585_2100, point)
+MRI.ESM2_future_value_min <- raster::extract(tmin_MRI.ESM2_ssp585_2100, point)
+
+CNRM.CM6_future_value_max <- raster::extract(tmax_CNRM.CM6_ssp585_2100, point)
+CNRM.CM6_future_value_min <- raster::extract(tmin_CNRM.CM6_ssp585_2100, point)
+
+CNRM.ESM21_future_value_max <- raster::extract(tmax_CNRM.ESM21_ssp585_2100, point)
+CNRM.ESM21_future_value_min <- raster::extract(tmin_CNRM.ESM21_ssp585_2100, point)
+
+CanESM5_future_value_max <- raster::extract(tmax_CanESM5_ssp585_2100, point)
+CanESM5_future_value_min <- raster::extract(tmin_CanESM5_ssp585_2100, point)
+
+MIROC.ES2L_future_value_max <- raster::extract(tmax_MIROC.ES2L_ssp585_2100, point)
+MIROC.ES2L_future_value_min <- raster::extract(tmin_MIROC.ES2L_ssp585_2100, point)
+
+MIROC6_future_value_max <- raster::extract(tmax_MIROC6_ssp585_2100, point)
+MIROC6_future_value_min <- raster::extract(tmin_MIROC6_ssp585_2100, point)
+
+
+
+
+
+future_monthly_temps <- as.data.frame(rbind(CSM2_future_value_max, CSM2_future_value_min, IPSL_future_value_max, IPSL_future_value_min,
+                             MRI.ESM2_future_value_max, MRI.ESM2_future_value_min, CNRM.CM6_future_value_max, CNRM.CM6_future_value_min,  
+                             CNRM.ESM21_future_value_max, CNRM.ESM21_future_value_min, CanESM5_future_value_max, CanESM5_future_value_min, 
+                             MIROC.ES2L_future_value_max, MIROC.ES2L_future_value_min, MIROC6_future_value_max, MIROC6_future_value_min))
+
+
+future_monthly_temps <- as.data.frame(t(future_monthly_temps))
+
+
+months <- c('Jan', 'Feb', 'Mar', 'Apr', 'May', 
+            'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 
+            'Nov', 'Dec')
+
+
+future_monthly_temps$month <- factor(months, levels=c('Jan', 'Feb', 'Mar', 'Apr', 'May', 
+                                                      'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 
+                                                      'Nov', 'Dec'), ordered = TRUE)
+
+future_monthly_temps <- future_monthly_temps%>%
+  remove_rownames()%>%
+  rename('CSM2_max_temp'='V1', 'CSM2_min_temp'='V2', 
+         'IPSL_max_temp'='V3', 'IPSL_min_temp'='V4',
+         'MRI.ESM2_max_temp'='V5', 'MRI.ESM2_min_temp'='V6', 
+         'CNRM.CM6_max_temp'='V7','CNRM.CM6_min_temp'='V8', 
+          'CNRM.ESM21_max_temp'='V9','CNRM.ESM21_min_temp'='V10', 
+         'CanESM5_max_temp'='V11','CanESM5_min_temp'='V12',
+          'MIROC.ES2L_max_temp'='V13','MIROC.ES2L_min_temp'='V14', 
+          'MIROC6_max_temp'='V15','MIROC6_min_temp'='V16')
+
+future_monthly_temps <- future_monthly_temps%>%
+  mutate(mean_future_max_temp=rowMeans(dplyr::select(., CSM2_max_temp, IPSL_max_temp, MRI.ESM2_max_temp,CNRM.CM6_max_temp,  CNRM.ESM21_max_temp,
+                                                    CanESM5_max_temp, MIROC.ES2L_max_temp, MIROC6_max_temp)), 
+         mean_future_min_temp=rowMeans(dplyr::select(., CSM2_min_temp, IPSL_min_temp, MRI.ESM2_min_temp,CNRM.CM6_min_temp,CNRM.ESM21_min_temp,
+                                                    CanESM5_min_temp,  MIROC.ES2L_min_temp,MIROC6_min_temp)))
+
+
+cols <- c('Mean max'='red', 'Mean min'='blue')
+
+dashed <- c('Future'='dashed', 'Current'='solid')
+
+
+ggplot()+
+  geom_line(aes(x=month, y=max_temp_celcius, colour='Mean max', linetype='Current'), data=monthly_temps, group=1)+
+  geom_line(aes(x=month, y=min_temp_celcius, colour='Mean min',linetype='Current'), data=monthly_temps, group=1)+
+  geom_line(aes(x=month, y=mean_future_max_temp,colour='Mean max', linetype='Future'), data=future_monthly_temps, group=1 )+
+  geom_line(aes(x=month, y=mean_future_min_temp, colour='Mean min', linetype='Future'), data=future_monthly_temps, group=1)+
+  theme_bw()+
+  labs(y='Temperature (°C)', x='Month')+
+  scale_colour_manual(name="",values=cols) + scale_linetype_manual(name="", values=dashed, breaks = c('Future', 'Current'))+
+  theme(axis.text=element_text(colour='black'))+
+  ggtitle('Current and future mean monthly temperature')
+
+
+```
+
+Step 5.3 
+
+Now use the future climate data with the predict function to predict germination months under future climate predictions. 
+
+We recommend setting 'lims(y=c(-0.05,1.05))' in the ggplot if you are looking at proportion germination
+
+
+```{r}
+#this is creating a dataframe with the temperatures that were downloaded previously
+## you can change the climate variable to min temp also by putting 'mean_temps$min_temp'
+newdata <- data.frame(future_monthly_temps$mean_future_max_temp, future_monthly_temps$mean_future_min_temp)%>%
+  rename('day_temp'='future_monthly_temps.mean_future_max_temp')%>%
+  rename('night_temp'='future_monthly_temps.mean_future_min_temp')
+
+#use the predict function to plot new temperatures with the model output
+df_future <- predict(full_mod, newdata, type='response', se.fit=TRUE)
+df_future <- as.data.frame(df_future)
+
+
+
+df_future$month <- factor(months, levels=c('Jan', 'Feb', 'Mar', 'Apr', 'May', 
+                                    'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 
+                                    'Nov', 'Dec'), ordered = TRUE)
+
+###in this dataframe, fit is the prediected germination response, se.fit is the standard error. 
+
+
+ggplot(df_future, aes(y=fit, x=month))+
+  geom_col()+
+  geom_errorbar(aes(ymax=fit+se.fit, ymin=fit-se.fit), width=0.2)+
+  labs(y="Predicted germination", x='Month')+
+  theme_classic()+
+  ggtitle('Predicted monthly germination in future climate')+
+  theme(axis.text = element_text(colour='black'))
+
+```
+
+
+
+
+Step 6 - combine the predicted germination data to create a graph that shows how germination is likely to change.
+
+We recommend setting 'lims(y=c(-0.05,1.05))' in the first ggplot if you are looking at proportion germination
+
+
+
+```{r echo=FALSE, message=FALSE}
+germination_change <- bind_cols(df$month, df$fit, df$se.fit, df_future$fit, df_future$se.fit)%>%
+  rename('month'='...1', 'current_pred_germ'='...2', 'current_pred_se'='...3', 'future_pred_germ'='...4', 'future_pred_se'='...5')
+
+
+
+germination_change_ggplot <-  germination_change%>%
+  mutate(germ_change=future_pred_germ-current_pred_germ)%>%
+  pivot_longer(cols=c(-month, -germ_change), names_to=c('time', 'pred_germ', 'se'), names_sep='_', values_to='values')%>%
+  pivot_wider(names_from = se, values_from=values)%>%
+  dplyr::select(-pred_germ)
+
+
+ggplot(germination_change_ggplot, aes(x=month, y=germ, fill=time))+
+  geom_col( position='dodge', colour='black')+
+  geom_errorbar(aes(x=month, ymax=germ+se, ymin=germ-se),width=0.2,  
+                position = position_dodge(width=.9))+
+  theme_bw()+
+  scale_fill_grey()+
+  labs(y='Predicted germination', x='Month', fill='Time period')+
+  theme(axis.text = element_text(colour='black'))+
+  ggtitle('Predicted monthly germination')
+
+
+
+ggplot(germination_change_ggplot)+
+  geom_point(aes(x=month, y=germ_change))+
+  geom_line(aes(x=month, y=germ_change), group=1, linetype='dashed', colour='grey')+
+  geom_hline(yintercept = 0)+
+  theme_bw()+
+  labs(y='Change in germination proportion', x='Month')+
+  ggtitle('predicted change in germination')
+  
+  
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
