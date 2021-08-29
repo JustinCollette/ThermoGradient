@@ -19,7 +19,7 @@ day_temp is the temperature of the cell during 'day' simulation,
 night_temp is the temperature of the cell during 'night' simulation,
 viable_n is the number of viable seeds in each cell - this can be determined before (with a 'global' viability) or after the experiment (via cut-tests). 
 
-An example of how the data needs to be set up can be found here: [link to example data?]
+An example of how the data needs to be set up can be found here: https://github.com/JustinCollette/ThermoGradient/blob/master/alectryon_subdentatus.csv
 
 
 You can run each 'chunk' of code by clicking the run button in the top right of each chunk, or you can run each line manually. 
