@@ -1,5 +1,5 @@
 ---
-title: "thermogradient_workflow_v6"
+title: "thermogradient_workflow"
 output:
   html_document:
     df_print: paged
