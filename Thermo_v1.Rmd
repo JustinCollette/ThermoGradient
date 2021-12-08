@@ -89,7 +89,7 @@ smooth_impute <- function(c_germ, days) {
   fm <- gam(y ~ s(x, bs = "cs", k = nrow(data)), data = data)
   preds <- round(predict(fm, newdata = data.frame(x = days), type = "response"))
   preds[preds < 0] <- 0
-  preds[preds > max(c_germ)] <- max(c_germ)
+  preds[preds > max(c_germ, na.rm = T)] <- max(c_germ, na.rm = T)
   preds
 }
 # apply the impute function
