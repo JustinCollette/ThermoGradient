@@ -1,4 +1,11 @@
 # ThermoGradient
+To access paper:
+
+https://doi.org/10.1093/aob/mcac026
+
+Please cite as:
+
+Justin C Collette, Karen D Sommerville, Mitchell B Lyons, Catherine A Offord, Graeme Errington, Zoe-Joy Newby, Lotte von Richter, Nathan J Emery, Stepping up to the thermogradient plate: a data framework for predicting seed germination under climate change, Annals of Botany, 2022;, mcac026, https://doi.org/10.1093/aob/mcac026
 
 This is a notebook file to be used in R. It is intended to be used after completion of a seed germination experiment on a Thermo Gradient Plate (TGP). 
 
